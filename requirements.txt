@@ -1,0 +1,10 @@
+# Temporary and unpinned. Owner: user#1.
+# Before the final week, freeze exact versions on the training machine: pip freeze > requirements.txt
+torch
+transformers
+datasets
+seqeval
+pytorch-crf
+pillow
+pyyaml
+mlflow

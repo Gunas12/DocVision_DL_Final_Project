@@ -1,0 +1,35 @@
+# Data and artifacts (never commit)
+data/raw/
+data/processed/
+data/cache/
+checkpoints/
+mlruns/
+wandb/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Secrets and OS files
+.env
+.DS_Store
+
+# LaTeX build files
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.nav
+*.snm
+
+# NOTE: runs/ (exported metrics) and data/splits/ MUST be committed.
