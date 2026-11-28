@@ -2,8 +2,9 @@
 
 import copy
 import json
+import math
 import re
-from numbers import Integral
+from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -70,16 +71,20 @@ def load_config(path, overrides=(), _parents=()):
 
 
 def validate_boxes(words, boxes):
-    """Reject malformed/reversed integer boxes; clip ordered coordinates."""
+    """Round finite reals (ties to even), reject reversed boxes, then clip."""
     if len(words) != len(boxes):
         raise ValueError("One box is required per word")
     result = []
     for box in boxes:
-        if len(box) != 4 or any(not isinstance(v, Integral) or isinstance(v, bool) for v in box):
-            raise ValueError("Boxes must contain four integers")
+        if not hasattr(box, "__len__") or len(box) != 4 or any(
+            not isinstance(v, Real) or isinstance(v, bool) or not math.isfinite(v) for v in box
+        ):
+            raise ValueError("Boxes must contain four finite real numbers")
+        rounded = [round(v) for v in box]
+        # Rounding or clipping must not hide reversed original coordinates.
         if box[0] > box[2] or box[1] > box[3]:
             raise ValueError("Box coordinates must be ordered")
-        result.append([max(0, min(1000, int(v))) for v in box])
+        result.append([max(0, min(1000, int(v))) for v in rounded])
     return result
 
 

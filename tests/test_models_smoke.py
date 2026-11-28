@@ -183,10 +183,27 @@ def test_predict_batch_hidden_truncation_and_reload(make_tagger, tmp_path, use_i
         tagger.predict_batch(docs, batch_size=0)
 
 
-@pytest.mark.parametrize("boxes", [[], [[0, 0, 1]], [[2, 0, 1, 3]], [[0, 4, 1, 3]], [[0, 0, 1.5, 2]]])
+@pytest.mark.parametrize("boxes", [
+    [], [None], [4], [[0, 0, 1]], [[0, 0, 1, 2, 3]],
+    [[2, 0, 1, 3]], [[0, 4, 1, 3]], [[1.49, 0, 1.4, 2]], [[1001.2, 0, 1000.8, 2]],
+    [[0, 0, float("nan"), 2]], [[0, -float("inf"), 1, 2]], [[0, 0, np.float32("inf"), 2]],
+    [[0, 0, "1", 2]], [[0, 0, True, 2]], [[0, 0, 1 + 2j, 2]],
+])
 def test_invalid_boxes(boxes):
     with pytest.raises(ValueError):
         validate_boxes(["tea"], boxes)
+
+
+@pytest.mark.parametrize("box, expected", [
+    ([0.0, 0.0, 1.5, 2.5], [0, 0, 2, 2]),
+    ([-10.6, -0.49, 1001.3, 2.51], [0, 0, 1000, 3]),
+    ([np.int64(-3), np.float32(1.6), np.float64(2.5), np.int32(4)], [0, 2, 2, 4]),
+])
+def test_real_boxes_round_and_encode(make_tagger, box, expected):
+    assert validate_boxes(["tea"], [box]) == [expected]
+    encoded = make_tagger(use_image=False).encode(["tea"], [box])
+    assert encoded["bbox"].dtype == torch.long
+    assert encoded["bbox"][0, 1].tolist() == expected
 
 
 def test_config_and_box_clipping(tmp_path):
