@@ -84,6 +84,38 @@ def test_forward_alignment_and_ablations(make_tagger, ablation):
         assert any(p.requires_grad for p in tagger.model.layoutlmv3.encoder.layer[1].parameters())
 
 
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("api", ["predict", "predict_batch"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_prediction_restores_modes(make_tagger, training, api, fail):
+    tagger = make_tagger().train(training)
+    tagger.model.dropout.eval()  # Preserve intentional mixed submodule modes too.
+    modes = {name: module.training for name, module in tagger.named_modules()}
+    observed = []
+
+    def inspect_mode(module, args):
+        assert torch.is_inference_mode_enabled()
+        assert all(not child.training for child in tagger.modules())
+        observed.append(True)
+        if fail:
+            raise RuntimeError("inference failed")
+
+    doc = {"words": ["tea"], "boxes": [[0, 0, 10, 10]]}
+    handle = tagger.model.register_forward_pre_hook(inspect_mode)
+    try:
+        kwargs = doc if api == "predict" else {"docs": [doc]}
+        if fail:
+            with pytest.raises(RuntimeError, match="inference failed"):
+                getattr(tagger, api)(**kwargs)
+        else:
+            getattr(tagger, api)(**kwargs)
+        assert observed == [True]
+    finally:
+        handle.remove()
+    assert tagger.predict_batch([]) == []
+    assert modes == {name: module.training for name, module in tagger.named_modules()}
+
+
 @pytest.mark.parametrize("labels, fallback", [(["B-item", "O", "I-item"], "O"), (["B-item", "I-item"], "B-item")])
 @pytest.mark.parametrize("use_image", [False, True])
 def test_truncated_words_use_outside_label(make_tagger, labels, fallback, use_image):
@@ -123,7 +155,7 @@ def test_inference_pads_to_batch_longest(make_tagger, use_image):
 
 @pytest.mark.parametrize("use_image", [False, True])
 def test_predict_batch_hidden_truncation_and_reload(make_tagger, tmp_path, use_image):
-    tagger = make_tagger(use_image=use_image)
+    tagger = make_tagger(use_image=use_image).eval()
     docs = [{"words": words, "boxes": [[0, 0, 10, 10]] * len(words)}
             for words in (["teapot", "tea"], ["teapot"] * 9, [], ["tea"] * 5 + ["teapot"])]
     results = tagger.predict_batch(docs, batch_size=2, return_hidden=True)

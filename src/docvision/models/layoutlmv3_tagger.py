@@ -178,9 +178,18 @@ class LayoutLMv3Tagger(torch.nn.Module):
 
     @torch.inference_mode()
     def predict_batch(self, docs, batch_size=8, return_hidden=False):
+        """Predict with dynamic padding, then restore every module's prior mode."""
+        modes = [(module, module.training) for module in self.modules()]
+        try:
+            self.eval()
+            return self._predict_batch(docs, batch_size, return_hidden)
+        finally:
+            for module, training in modes:
+                module.training = training
+
+    def _predict_batch(self, docs, batch_size, return_hidden):
         if not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
-        self.eval()
         results = []
         for start in range(0, len(docs), batch_size):
             batch = docs[start:start + batch_size]
