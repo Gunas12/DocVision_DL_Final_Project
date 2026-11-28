@@ -19,6 +19,7 @@ Conventions:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -113,3 +114,28 @@ def load_cord_split(split: str, root: str | Path = DEFAULT_ROOT) -> Iterator[Cor
         yield CordSample(
             sample_id=f"cord-{split}-{i:04d}", split=split, index=i, width=width, height=height, **parsed
         )
+
+
+def fingerprint(ground_truth: str) -> str:
+    """Short content hash of a raw ``ground_truth`` string (used to detect duplicate receipts)."""
+    return hashlib.sha1(ground_truth.encode("utf-8")).hexdigest()[:16]
+
+
+def make_manifest(raw_by_split: dict[str, list[str]]) -> dict[str, Any]:
+    """Build the frozen split manifest from raw ground-truth strings, one list per split."""
+    splits: dict[str, list[str]] = {}
+    fingerprints: dict[str, str] = {}
+    for split in SPLITS:
+        ids = []
+        for i, raw in enumerate(raw_by_split[split]):
+            sample_id = f"cord-{split}-{i:04d}"
+            ids.append(sample_id)
+            fingerprints[sample_id] = fingerprint(raw)
+        splits[split] = ids
+    return {
+        "name": "cord_split_v1",
+        "source": "naver-clova-ix/cord-v2 official split (not re-sampled)",
+        "sizes": {k: len(v) for k, v in splits.items()},
+        "splits": splits,
+        "fingerprints": fingerprints,
+    }
