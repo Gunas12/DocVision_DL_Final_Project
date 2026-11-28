@@ -256,13 +256,13 @@ def training_case(make_tagger, tmp_path):
                 "labels": ["B-item"] + ["I-item"] * (len(words) - 1)}
                for words in (["tea"], ["teapot", "tea"], ["tea", "teapot"], ["teapot"])]
 
-    def make(name="run", *, use_image=False, tracker=None, metric_fn=None, **options):
+    def make(name="run", *, use_image=False, tracker=None, metric_fn=None, seed=13, overwrite=False, **options):
         training = {"batch_size": 1, "grad_accum_steps": 1, "lr": 0.01, "weight_decay": 0.01,
                     "warmup_ratio": 0.25, "max_epochs": 2, "max_steps": None,
                     "early_stopping_patience": 20, "eval_every_steps": 3, "save_every_steps": 1, **options}
-        config = {"seed": 13, "precision": "bf16", "output_dir": str(tmp_path / name), "training": training}
+        config = {"seed": seed, "precision": "bf16", "output_dir": str(tmp_path / name), "training": training}
         return Trainer(make_tagger(use_image=use_image), records, records, config,
-                       tracker=tracker, metric_fn=metric_fn)
+                       tracker=tracker, metric_fn=metric_fn, overwrite=overwrite)
     return make
 
 
@@ -303,7 +303,7 @@ def test_resume_reproduces_losses_and_rng(training_case, accumulation):
     partial = training_case("resume", grad_accum_steps=accumulation)
     partial.fit(stop_after=1)
     assert partial.state["step_in_epoch"] == accumulation
-    resumed = training_case("resume", grad_accum_steps=accumulation)
+    resumed = training_case("resume", grad_accum_steps=accumulation, overwrite=accumulation == 2)
     assert resumed.fit(resume="auto") == losses
     assert resumed.state == full.state and resumed.scheduler.state_dict() == full.scheduler.state_dict()
     for actual, expected in zip(resumed.tagger.parameters(), full.tagger.parameters()):
@@ -363,3 +363,38 @@ def test_checkpoint_failure_recovery_and_split_guards(training_case, monkeypatch
                    lambda: Trainer(trainer.tagger, bad, bad, trainer.config)):
         with pytest.raises(ValueError, match="test split"):
             action()
+
+
+@pytest.mark.parametrize("artifact", ["last", "best", "metrics.jsonl"])
+def test_fresh_run_refuses_each_existing_artifact(training_case, artifact):
+    trainer = training_case()
+    path = trainer.run_dir / artifact
+    path.write_text("existing log", encoding="utf-8") if artifact.endswith("jsonl") else path.mkdir()
+    with pytest.raises(FileExistsError, match="resume.*overwrite=True"):
+        trainer.fit(stop_after=1)
+    assert path.exists()
+    if artifact.endswith("jsonl"):
+        assert path.read_text(encoding="utf-8") == "existing log"
+    else:
+        assert not (trainer.run_dir / "metrics.jsonl").exists()
+
+
+def test_fresh_seed_preserves_prior_run_and_overwrite_replaces_it(training_case, tmp_path):
+    original = training_case(eval_every_steps=1)
+    original.fit(stop_after=1)
+    snapshot = {p.relative_to(original.run_dir): p.read_bytes() for p in original.run_dir.rglob("*") if p.is_file()}
+    fresh = training_case(seed=42, eval_every_steps=1)
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        fresh.fit(stop_after=1)
+    assert snapshot == {p.relative_to(fresh.run_dir): p.read_bytes() for p in fresh.run_dir.rglob("*") if p.is_file()}
+    (fresh.run_dir / "old-only.txt").write_text("old artifact", encoding="utf-8")
+    sibling = tmp_path / "outside.txt"
+    sibling.write_text("keep", encoding="utf-8")
+    replacement = training_case(seed=42, overwrite=True, eval_every_steps=1)
+    replacement.fit(stop_after=1)
+    replacement.fit(stop_after=2)  # Continuing the same Trainer must not clear its run.
+    rows = [json.loads(line) for line in (replacement.run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [row["seed"] for row in rows if row["kind"] == "run"] == [42]
+    assert replacement.state["global_step"] == 2 and not (replacement.run_dir / "old-only.txt").exists()
+    assert sibling.read_text(encoding="utf-8") == "keep"
+    assert load_tagger(replacement.run_dir / "best").config["seed"] == 42

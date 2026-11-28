@@ -38,8 +38,9 @@ def resolve_precision(device, precision):
 
 class Trainer:
     def __init__(self, tagger, train_records, val_records, config=None, *, device="cpu",
-                 init_from=None, tracker=None, metric_fn=None):
+                 init_from=None, tracker=None, metric_fn=None, overwrite=False):
         self.device, self.init_from = torch.device(device), init_from
+        self.overwrite, self._started, self._resumed = overwrite, False, False
         self.tagger = load_tagger(init_from, device) if init_from else tagger.to(device)
         self.config = _merge(self.tagger.config, config or {})
         _reject_test_split(self.config)
@@ -83,17 +84,33 @@ class Trainer:
         metrics_module, tracking_module = "docvision.evaluation.metrics", "docvision.utils.tracking"
         if metric_fn is None and importlib.util.find_spec(metrics_module):
             metric_fn = importlib.import_module(metrics_module).entity_f1
-        if tracker is None and importlib.util.find_spec(tracking_module):
-            tracker = importlib.import_module(tracking_module).create_tracker(self.config, self.run_dir)
+        self._tracking_module = tracking_module if tracker is None and importlib.util.find_spec(tracking_module) else None
         self.metric_fn, self.tracker = metric_fn, tracker
         try:
             self.commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[3],
                                          capture_output=True, text=True, check=False).stdout.strip() or "unknown"
         except OSError:
             self.commit = "unknown"
-        if tracker:
-            tracker.log_params({"config": json.dumps(self.config), "seed": self.seed, "git_commit": self.commit})
+
+    def _start_run(self):
+        if self._started:
+            return
+        if not self._resumed:
+            artifacts = ("last", "best", "metrics.jsonl", ".last.previous", ".best.previous")
+            if not self.overwrite and any((self.run_dir / name).exists() for name in artifacts):
+                raise FileExistsError("Run directory contains results; use resume, another output_dir, or overwrite=True")
+            if self.overwrite:
+                # The resolved output directory is the sole deletion target.
+                if self.run_dir in Path(__file__).resolve().parents:
+                    raise ValueError("Refusing to clear a source directory or its ancestors")
+                shutil.rmtree(self.run_dir)
+                self.run_dir.mkdir()
+        if self._tracking_module:
+            self.tracker = importlib.import_module(self._tracking_module).create_tracker(self.config, self.run_dir)
+        if self.tracker:
+            self.tracker.log_params({"config": json.dumps(self.config), "seed": self.seed, "git_commit": self.commit})
         self._log("run", config=self.config, seed=self.seed, git_commit=self.commit, precision=self.precision)
+        self._started = True
 
     def _log(self, kind, **values):
         with (self.run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
@@ -124,6 +141,7 @@ class Trainer:
         _reject_test_split({"split": getattr(records, "split", None)})
         for record in records:
             _reject_test_split(record)
+        self._start_run()
         predicted = self.tagger.predict_batch(records, batch_size=self.options["batch_size"])
         gold, labels = [r["labels"] for r in records], [r["labels"] for r in predicted]
         if self.metric_fn:
@@ -155,6 +173,7 @@ class Trainer:
         """Publish a complete directory by rename; recover the backup after a killed swap."""
         if name not in ("last", "best"):
             raise ValueError("Checkpoint name must be last or best")
+        self._start_run()
         path, previous = self._recover(name), self.run_dir / f".{name}.previous"
         with tempfile.TemporaryDirectory(prefix=f".{name}-", dir=self.run_dir) as temporary:
             directory = Path(temporary)
@@ -206,11 +225,13 @@ class Trainer:
             with (self.run_dir / "metrics.jsonl").open("r+b") as stream:
                 stream.truncate(offset)
         self.state = state
+        self._resumed = True
 
     def fit(self, *, resume=None, stop_after=None):
         """Return update losses; stop_after interrupts at an absolute optimizer step."""
         if resume:
             self.resume(resume)
+        self._start_run()
         if stop_after and self.state["global_step"] >= stop_after:
             return self.state["losses"]
         batch_size, accumulation = self.options["batch_size"], self.options["grad_accum_steps"]
