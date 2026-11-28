@@ -170,7 +170,7 @@ class Trainer:
         return path
 
     def save_checkpoint(self, name="last"):
-        """Publish a complete directory by rename; recover the backup after a killed swap."""
+        """Publish assets by rename: last has resume state; best has three progress values."""
         if name not in ("last", "best"):
             raise ValueError("Checkpoint name must be last or best")
         self._start_run()
@@ -179,11 +179,13 @@ class Trainer:
             directory = Path(temporary)
             self.tagger.save_pretrained(directory)
             (directory / "config.yaml").write_text(yaml.safe_dump(self.config), encoding="utf-8")
-            state = {**self.state, "optimizer": self.optimizer.state_dict(), "scheduler": self.scheduler.state_dict(),
-                     "log_offset": (self.run_dir / "metrics.jsonl").stat().st_size,
-                     "scaler": self.scaler.state_dict() if self.scaler else None, "python_rng": random.getstate(),
-                     "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(),
-                     "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+            state = {key: self.state[key] for key in ("best_metric", "global_step", "epoch")}
+            if name == "last":
+                state = {**self.state, "optimizer": self.optimizer.state_dict(), "scheduler": self.scheduler.state_dict(),
+                         "log_offset": (self.run_dir / "metrics.jsonl").stat().st_size,
+                         "scaler": self.scaler.state_dict() if self.scaler else None, "python_rng": random.getstate(),
+                         "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(),
+                         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
             torch.save(state, directory / "trainer_state.pt")
             if previous.exists():
                 shutil.rmtree(previous)
@@ -202,13 +204,15 @@ class Trainer:
         path = self._recover("last") if checkpoint == "auto" else Path(checkpoint)
         if checkpoint == "auto" and not path.exists():
             return
+        state = torch.load(path / "trainer_state.pt", map_location="cpu", weights_only=False)
+        if "optimizer" not in state:
+            raise ValueError("Inference checkpoint: resume from last/ or use init_from for fresh fine-tuning")
         restored = load_tagger(path, self.device)
         if any(restored.config.get(k) != self.config.get(k) for k in
                ("training", "seed", "max_length", "ablation", "precision")) or restored.id2label != self.tagger.id2label:
             raise ValueError("Resume requires the original training schedule and label map")
         self.tagger.model.load_state_dict(restored.model.state_dict())
         self.tagger.processor = restored.processor
-        state = torch.load(path / "trainer_state.pt", map_location="cpu", weights_only=False)
         self.optimizer.load_state_dict(state.pop("optimizer"))
         self.scheduler.load_state_dict(state.pop("scheduler"))
         scaler = state.pop("scaler")

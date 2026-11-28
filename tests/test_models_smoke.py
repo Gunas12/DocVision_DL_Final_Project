@@ -398,3 +398,27 @@ def test_fresh_seed_preserves_prior_run_and_overwrite_replaces_it(training_case,
     assert replacement.state["global_step"] == 2 and not (replacement.run_dir / "old-only.txt").exists()
     assert sibling.read_text(encoding="utf-8") == "keep"
     assert load_tagger(replacement.run_dir / "best").config["seed"] == 42
+
+
+def test_best_is_lightweight_and_last_retains_resume_state(training_case, monkeypatch):
+    trainer = training_case(eval_every_steps=1)
+    trainer.fit(stop_after=1)
+    best = trainer.run_dir / "best"
+    best_state = torch.load(best / "trainer_state.pt", weights_only=False)
+    assert best_state == {key: trainer.state[key] for key in ("best_metric", "global_step", "epoch")}
+    last_state = torch.load(trainer.run_dir / "last/trainer_state.pt", weights_only=False)
+    assert last_state["optimizer"]["state"] and last_state["losses"] == trainer.state["losses"]
+    assert {"scheduler", "scaler", "python_rng", "numpy_rng", "torch_rng", "cuda_rng", "step_in_epoch"} <= last_state.keys()
+    with monkeypatch.context() as patch:
+        patch.setattr(trainer.optimizer, "state_dict", Mock(side_effect=AssertionError("optimizer serialized")))
+        patch.setattr(trainer.scheduler, "state_dict", Mock(side_effect=AssertionError("scheduler serialized")))
+        patch.setattr(trainer, "scaler", Mock(state_dict=Mock(side_effect=AssertionError("scaler serialized"))))
+        trainer.save_checkpoint("best")
+    doc = trainer.train_records[0]
+    expected = trainer.tagger.predict(doc["words"], doc["boxes"])
+    actual = load_tagger(best).predict(doc["words"], doc["boxes"])
+    np.testing.assert_allclose(actual["label_probs"], expected["label_probs"], atol=1e-6)
+    fresh = training_case("cannot-resume-best")
+    with pytest.raises(ValueError, match="resume from last.*init_from"):
+        fresh.fit(resume=best)
+    assert fresh.state["global_step"] == 0 and not fresh.optimizer.state
