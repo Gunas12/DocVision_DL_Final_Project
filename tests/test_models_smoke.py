@@ -28,7 +28,8 @@ from docvision.models.layoutlmv3_tagger import (
 
 @pytest.fixture
 def make_tagger():
-    def make(*, gradient_checkpointing=True, **ablation):
+    def make(*, labels=None, gradient_checkpointing=True, **ablation):
+        labels = ["O", "B-item", "I-item"] if labels is None else labels
         torch.manual_seed(13)
         torch.set_num_threads(2)
         vocab = {word: i for i, word in enumerate(
@@ -43,10 +44,10 @@ def make_tagger():
         model = LayoutLMv3ForTokenClassification(LayoutLMv3Config(
             vocab_size=len(vocab), hidden_size=32, coordinate_size=4, shape_size=8,
             num_hidden_layers=2, num_attention_heads=2, intermediate_size=37,
-            max_position_embeddings=16, input_size=16, patch_size=8, num_labels=3,
+            max_position_embeddings=16, input_size=16, patch_size=8, num_labels=len(labels),
             visual_embed=ablation.get("use_image", True),
         ))
-        return LayoutLMv3Tagger(config, ["O", "B-item", "I-item"], model=model, processor=processor)
+        return LayoutLMv3Tagger(config, labels, model=model, processor=processor)
     return make
 
 
@@ -81,6 +82,17 @@ def test_forward_alignment_and_ablations(make_tagger, ablation):
             if not name.startswith("encoder.") or name.startswith("encoder.layer.0."):
                 assert not parameter.requires_grad and parameter.grad is None
         assert any(p.requires_grad for p in tagger.model.layoutlmv3.encoder.layer[1].parameters())
+
+
+@pytest.mark.parametrize("labels, fallback", [(["B-item", "O", "I-item"], "O"), (["B-item", "I-item"], "B-item")])
+@pytest.mark.parametrize("use_image", [False, True])
+def test_truncated_words_use_outside_label(make_tagger, labels, fallback, use_image):
+    tagger = make_tagger(labels=labels, use_image=use_image)
+    result = tagger.predict(["teapot"] * 9, [[0, 0, 10, 10]] * 9, return_hidden=True)
+    assert result["truncated"] and result["labels"][3:] == [fallback] * 6
+    assert all(prob > 0 for prob in result["probs"][:3])
+    assert result["probs"][3:] == [0.0] * 6
+    assert np.all(result["label_probs"][3:] == 0) and np.all(result["hidden"][3:] == 0)
 
 
 @pytest.mark.parametrize("use_image", [False, True])

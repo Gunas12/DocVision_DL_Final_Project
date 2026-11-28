@@ -86,8 +86,8 @@ def validate_boxes(words, boxes):
 class LayoutLMv3Tagger(torch.nn.Module):
     """Word tagger with injectable model/processor for offline smoke tests.
 
-    Missing images use a white RGB canvas. Unrepresented words get the first
-    configured label and zero probabilities/hidden vectors; inspect `truncated`.
+    Missing images use a white RGB canvas. Unrepresented words get "O" (or the
+    first label if absent) and zero probabilities/vectors; inspect `truncated`.
     freeze_lower_layers=0 leaves all parameters trainable.
     """
 
@@ -205,7 +205,10 @@ class LayoutLMv3Tagger(torch.nn.Module):
                 word_ids, tokens = list(first), list(first.values())
                 probs = np.zeros((len(doc["words"]), len(self.id2label)), dtype=np.float32)
                 probs[word_ids] = probabilities[i, tokens]
-                result = {"labels": [self.id2label[int(j)] for j in probs.argmax(-1)],
+                labels = [self.id2label[self.label2id.get("O", 0)]] * len(probs)
+                for word in first:
+                    labels[word] = self.id2label[int(probs[word].argmax())]
+                result = {"labels": labels,
                           "probs": probs.max(-1).tolist(), "label_probs": probs,
                           "truncated": bool(encoding.encodings[0].overflowing) or len(first) < len(probs)}
                 if return_hidden:
