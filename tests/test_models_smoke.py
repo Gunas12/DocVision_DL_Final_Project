@@ -51,6 +51,22 @@ def make_tagger():
     return make
 
 
+@pytest.mark.parametrize("modern", [False, True])
+def test_checkpointing_api_selection(make_tagger, monkeypatch, modern):
+    tagger = make_tagger(gradient_checkpointing=False)
+    calls = []
+    if modern:
+        monkeypatch.setattr(tagger.model, "activation_checkpointing_enable", lambda **kwargs: calls.append(kwargs))
+        argument = "activation_checkpointing_kwargs"
+    else:
+        monkeypatch.setattr(tagger.model, "activation_checkpointing_enable", None)
+        monkeypatch.setattr(tagger.model, "gradient_checkpointing_enable", lambda **kwargs: calls.append(kwargs))
+        argument = "gradient_checkpointing_kwargs"
+    config = {**tagger.config, "gradient_checkpointing": True}
+    LayoutLMv3Tagger(config, model=tagger.model, processor=tagger.processor)
+    assert calls == [{argument: {"use_reentrant": False}}]
+
+
 @pytest.mark.parametrize("ablation", [{}, {"use_layout": False}, {"use_image": False}, {"freeze_lower_layers": 1}])
 def test_forward_alignment_and_ablations(make_tagger, ablation):
     reference_tagger = make_tagger(gradient_checkpointing=False, **ablation)
