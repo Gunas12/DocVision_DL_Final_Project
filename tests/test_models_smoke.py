@@ -84,6 +84,32 @@ def test_forward_alignment_and_ablations(make_tagger, ablation):
 
 
 @pytest.mark.parametrize("use_image", [False, True])
+def test_inference_pads_to_batch_longest(make_tagger, use_image):
+    tagger = make_tagger(use_image=use_image).eval()
+    docs = [{"words": words, "boxes": [[0, 0, 10, 10]] * len(words)}
+            for words in (["tea"], ["teapot", "tea"])]
+    lengths = []
+    handle = tagger.model.register_forward_pre_hook(
+        lambda module, args, kwargs: lengths.append(kwargs["input_ids"].shape[1]), with_kwargs=True,
+    )
+    try:
+        single = tagger.predict(**docs[0])
+        batched = tagger.predict_batch(docs, batch_size=2)
+    finally:
+        handle.remove()
+    assert lengths == [3, 5] and max(lengths) < tagger.config["max_length"]
+    for doc, result in zip(docs, batched):
+        padded = tagger.encode(**doc)
+        assert padded["input_ids"].shape[1] == tagger.config["max_length"]
+        with torch.inference_mode():
+            probabilities = tagger(**padded).logits.softmax(-1)[0].numpy()
+        first = [i for i, word in enumerate(padded.word_ids())
+                 if word is not None and (i == 0 or padded.word_ids()[i - 1] != word)]
+        np.testing.assert_allclose(result["label_probs"], probabilities[first], atol=1e-4)
+    np.testing.assert_allclose(single["label_probs"], batched[0]["label_probs"], atol=1e-4)
+
+
+@pytest.mark.parametrize("use_image", [False, True])
 def test_predict_batch_hidden_truncation_and_reload(make_tagger, tmp_path, use_image):
     tagger = make_tagger(use_image=use_image)
     docs = [{"words": words, "boxes": [[0, 0, 10, 10]] * len(words)}

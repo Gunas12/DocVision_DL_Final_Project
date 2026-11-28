@@ -140,11 +140,12 @@ class LayoutLMv3Tagger(torch.nn.Module):
             )
         self.to(device)
 
-    def encode(self, words, boxes, image=None, word_labels=None):
+    def encode(self, words, boxes, image=None, word_labels=None, *, padding="max_length"):
+        """Align a document; fixed padding remains the training default."""
         boxes = validate_boxes(words, boxes)
         if word_labels is not None and len(word_labels) != len(words):
             raise ValueError("One label is required per word")
-        kwargs = {"boxes": boxes, "truncation": True, "padding": "max_length",
+        kwargs = {"boxes": boxes, "truncation": True, "padding": padding,
                   "max_length": self.config.get("max_length", 512), "return_tensors": "pt"}
         if self.use_image:
             image = image if image is not None else Image.new(
@@ -185,9 +186,14 @@ class LayoutLMv3Tagger(torch.nn.Module):
             batch = docs[start:start + batch_size]
             if any(doc.get("split") == "test" for doc in batch):
                 raise ValueError("The test split is reserved for user#4")
-            encodings = [self.encode(d["words"], d["boxes"], d.get("image")) for d in batch]
-            inputs = {k: torch.cat([e[k] for e in encodings]).to(next(self.parameters()).device)
-                      for k in encodings[0]}
+            encodings = [self.encode(d["words"], d["boxes"], d.get("image"), padding=False) for d in batch]
+            inputs = self.processor.tokenizer.pad(
+                [{k: v[0] for k, v in e.items() if k != "pixel_values"} for e in encodings],
+                padding=True, return_tensors="pt",
+            )
+            if self.use_image:
+                inputs["pixel_values"] = torch.cat([e["pixel_values"] for e in encodings])
+            inputs = inputs.to(next(self.parameters()).device)
             output = self(**inputs, output_hidden_states=return_hidden)
             probabilities = output.logits.softmax(-1).float().cpu().numpy()
             hidden = output.hidden_states[-1][:, :inputs["input_ids"].shape[1]] if return_hidden else None
