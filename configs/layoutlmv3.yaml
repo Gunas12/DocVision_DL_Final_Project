@@ -1,0 +1,9 @@
+inherit: base.yaml
+model:
+  name: layoutlmv3
+  pretrained: microsoft/layoutlmv3-base
+image_size: 224
+ablation:
+  use_layout: true
+  use_image: true
+  freeze_lower_layers: 0
