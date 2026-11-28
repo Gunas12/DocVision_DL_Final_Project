@@ -28,7 +28,7 @@ from docvision.models.layoutlmv3_tagger import (
 
 @pytest.fixture
 def make_tagger():
-    def make(**ablation):
+    def make(*, gradient_checkpointing=True, **ablation):
         torch.manual_seed(13)
         torch.set_num_threads(2)
         vocab = {word: i for i, word in enumerate(
@@ -39,7 +39,7 @@ def make_tagger():
         processor = LayoutLMv3Processor(LayoutLMv3ImageProcessor(apply_ocr=False),
                                        LayoutLMv3TokenizerFast(tokenizer_object=backend))
         config = {"model": {"name": "layoutlmv3", "pretrained": "offline"}, "max_length": 8,
-                  "image_size": 16, "ablation": ablation, "gradient_checkpointing": True}
+                  "image_size": 16, "ablation": ablation, "gradient_checkpointing": gradient_checkpointing}
         model = LayoutLMv3ForTokenClassification(LayoutLMv3Config(
             vocab_size=len(vocab), hidden_size=32, coordinate_size=4, shape_size=8,
             num_hidden_layers=2, num_attention_heads=2, intermediate_size=37,
@@ -52,25 +52,29 @@ def make_tagger():
 
 @pytest.mark.parametrize("ablation", [{}, {"use_layout": False}, {"use_image": False}, {"freeze_lower_layers": 1}])
 def test_forward_alignment_and_ablations(make_tagger, ablation):
+    reference_tagger = make_tagger(gradient_checkpointing=False, **ablation)
     tagger = make_tagger(**ablation)
+    encoder = tagger.model.layoutlmv3.encoder
+    assert encoder.gradient_checkpointing
+    assert all(layer.gradient_checkpointing for layer in encoder.layer)
+    assert all(layer._gradient_checkpointing_func.keywords["use_reentrant"] is False for layer in encoder.layer)
+    assert not reference_tagger.model.layoutlmv3.encoder.gradient_checkpointing
     inputs = tagger.encode(["teapot", "tea"], [[-5, 0, 1200, 20], [0, 0, 3, 4]], word_labels=["B-item", "O"])
     assert inputs["labels"].tolist() == [[-100, 1, -100, 0, -100, -100, -100, -100]]
     assert ("pixel_values" in inputs) == tagger.use_image
     if not tagger.use_layout:
         assert inputs["bbox"].count_nonzero() == 0
     rng = torch.get_rng_state()
-    tagger.config["gradient_checkpointing"] = False
-    reference = tagger(**inputs)
+    reference = reference_tagger(**inputs)
     reference.loss.backward()
-    gradient = tagger.model.classifier.weight.grad.clone()
-    tagger.zero_grad(set_to_none=True)
     torch.set_rng_state(rng)
-    tagger.config["gradient_checkpointing"] = True
     output = tagger(**inputs)
     assert output.logits.shape == (1, 8, 3) and torch.isfinite(output.loss)
     output.loss.backward()
     torch.testing.assert_close(output.loss, reference.loss)
-    torch.testing.assert_close(tagger.model.classifier.weight.grad, gradient)
+    reference_parameters = dict(reference_tagger.named_parameters())
+    for name, parameter in tagger.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference_parameters[name].grad)
     assert tagger.model.classifier.weight.grad is not None
     if ablation.get("freeze_lower_layers"):
         for name, parameter in tagger.model.layoutlmv3.named_parameters():

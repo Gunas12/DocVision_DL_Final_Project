@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
-from torch.utils.checkpoint import checkpoint
 from transformers import (
     LayoutLMv3Config,
     LayoutLMv3ForTokenClassification,
@@ -133,6 +132,12 @@ class LayoutLMv3Tagger(torch.nn.Module):
                     name.startswith(f"encoder.layer.{i}.") for i in range(count)
                 ):
                     parameter.requires_grad_(False)
+        if config.get("gradient_checkpointing", False):
+            # Transformers 5.24.1 omits this flag despite checkpoint-capable layers.
+            self.model.supports_gradient_checkpointing = True
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
         self.to(device)
 
     def encode(self, words, boxes, image=None, word_labels=None):
@@ -164,9 +169,6 @@ class LayoutLMv3Tagger(torch.nn.Module):
             inputs["bbox"] = torch.zeros_like(inputs["bbox"])
         if not self.use_image:
             inputs.pop("pixel_values", None)
-        # Checkpoint the complete forward; LayoutLMv3's native support varies.
-        if self.config.get("gradient_checkpointing", False) and self.training and torch.is_grad_enabled():
-            return checkpoint(self.model, use_reentrant=False, **inputs)
         return self.model(**inputs)
 
     def predict(self, words, boxes, image=None, return_hidden=False):
