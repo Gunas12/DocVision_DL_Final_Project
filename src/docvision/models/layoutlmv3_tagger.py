@@ -140,9 +140,13 @@ class LayoutLMv3Tagger(torch.nn.Module):
         if config.get("gradient_checkpointing", False):
             # Transformers 5.24.1 omits this flag despite checkpoint-capable layers.
             self.model.supports_gradient_checkpointing = True
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
+            activation_enable = getattr(self.model, "activation_checkpointing_enable", None)
+            if callable(activation_enable):
+                activation_enable(activation_checkpointing_kwargs={"use_reentrant": False})
+            else:
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
         self.to(device)
 
     def encode(self, words, boxes, image=None, word_labels=None, *, padding="max_length"):

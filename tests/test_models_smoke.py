@@ -1,5 +1,8 @@
 """Offline model checks; pretrained weights are explicitly opt-in."""
+import json
 import os
+import random
+from unittest.mock import Mock
 
 import pytest
 
@@ -24,6 +27,7 @@ from docvision.models.layoutlmv3_tagger import (
     load_tagger,
     validate_boxes,
 )
+from docvision.training.trainer import Trainer, resolve_precision
 
 
 @pytest.fixture
@@ -49,6 +53,22 @@ def make_tagger():
         ))
         return LayoutLMv3Tagger(config, labels, model=model, processor=processor)
     return make
+
+
+@pytest.mark.parametrize("modern", [False, True])
+def test_checkpointing_api_selection(make_tagger, monkeypatch, modern):
+    tagger = make_tagger(gradient_checkpointing=False)
+    calls = []
+    if modern:
+        monkeypatch.setattr(tagger.model, "activation_checkpointing_enable", lambda **kwargs: calls.append(kwargs))
+        argument = "activation_checkpointing_kwargs"
+    else:
+        monkeypatch.setattr(tagger.model, "activation_checkpointing_enable", None)
+        monkeypatch.setattr(tagger.model, "gradient_checkpointing_enable", lambda **kwargs: calls.append(kwargs))
+        argument = "gradient_checkpointing_kwargs"
+    config = {**tagger.config, "gradient_checkpointing": True}
+    LayoutLMv3Tagger(config, model=tagger.model, processor=tagger.processor)
+    assert calls == [{argument: {"use_reentrant": False}}]
 
 
 @pytest.mark.parametrize("ablation", [{}, {"use_layout": False}, {"use_image": False}, {"freeze_lower_layers": 1}])
@@ -228,3 +248,219 @@ def test_pretrained_layoutlmv3_forward():
     inputs = tagger.encode(["tea", "milk", "tax", "total", "5"], [[0, 0, 10, 10]] * 5)
     with torch.inference_mode():
         assert tagger(**inputs).logits.shape == (1, 512, 2)
+
+
+@pytest.fixture
+def training_case(make_tagger, tmp_path):
+    records = [{"words": words, "boxes": [[0, 0, 10, 10]] * len(words),
+                "labels": ["B-item"] + ["I-item"] * (len(words) - 1)}
+               for words in (["tea"], ["teapot", "tea"], ["tea", "teapot"], ["teapot"])]
+
+    def make(name="run", *, use_image=False, tracker=None, metric_fn=None, seed=13, overwrite=False, **options):
+        training = {"batch_size": 1, "grad_accum_steps": 1, "lr": 0.01, "weight_decay": 0.01,
+                    "warmup_ratio": 0.25, "max_epochs": 2, "max_steps": None,
+                    "early_stopping_patience": 20, "eval_every_steps": 3, "save_every_steps": 1, **options}
+        config = {"seed": seed, "precision": "bf16", "output_dir": str(tmp_path / name), "training": training}
+        return Trainer(make_tagger(use_image=use_image), records, records, config,
+                       tracker=tracker, metric_fn=metric_fn, overwrite=overwrite)
+    return make
+
+
+@pytest.mark.parametrize("device, requested, capability, expected", [
+    ("cpu", "bf16", 0, "fp32"), ("cpu", "fp16", 0, "fp32"), ("cpu", "fp32", 0, "fp32"),
+    ("cuda", "bf16", 7, "fp16"), ("cuda", "bf16", 8, "bf16"), ("cuda", "fp16", 7, "fp16"),
+])
+def test_precision_policy(monkeypatch, caplog, device, requested, capability, expected):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (capability, 0))
+    assert resolve_precision(device, requested) == expected
+    assert ("falling back" in caplog.text) == (device == "cuda" and requested == "bf16" and capability < 8)
+    with pytest.raises(ValueError):
+        resolve_precision(device, "invalid")
+
+
+@pytest.mark.parametrize("use_image", [False, True])
+def test_training_collate_and_update(training_case, use_image, monkeypatch):
+    trainer = training_case(use_image=use_image)
+    inputs = trainer.collate(trainer.train_records[:2])
+    assert inputs["input_ids"].shape == (2, 5)
+    assert inputs["labels"][0, 3:].tolist() == [-100, -100]
+    assert inputs["bbox"][0, 3:].count_nonzero() == 0
+    assert ("pixel_values" in inputs) == use_image
+    assert trainer.precision == "fp32" and trainer.scaler is None
+    clip = Mock(wraps=torch.nn.utils.clip_grad_norm_)
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
+    assert len(trainer.fit(stop_after=1)) == 1 and clip.call_args.args[1] == 1.0
+    assert trainer.scheduler.last_epoch == 1 and trainer.scheduler.get_last_lr()[0] == 0.005
+
+
+@pytest.mark.parametrize("accumulation", [1, 2, 3])
+def test_resume_reproduces_losses_and_rng(training_case, accumulation):
+    full = training_case("full", grad_accum_steps=accumulation)
+    losses = full.fit()
+    assert len(losses) == ((4 + accumulation - 1) // accumulation) * 2
+    assert np.mean(losses[-2:]) < np.mean(losses[:2]) and full.scheduler.get_last_lr() == [0.0]
+    rng = (random.random(), np.random.rand(), torch.rand(2))
+    partial = training_case("resume", grad_accum_steps=accumulation)
+    partial.fit(stop_after=1)
+    assert partial.state["step_in_epoch"] == accumulation
+    resumed = training_case("resume", grad_accum_steps=accumulation, overwrite=accumulation == 2)
+    assert resumed.fit(resume="auto") == losses
+    assert resumed.state == full.state and resumed.scheduler.state_dict() == full.scheduler.state_dict()
+    for actual, expected in zip(resumed.tagger.parameters(), full.tagger.parameters()):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (random.random(), np.random.rand()) == rng[:2]
+    torch.testing.assert_close(torch.rand(2), rng[2], atol=0, rtol=0)
+    state = torch.load(resumed.run_dir / "last/trainer_state.pt", weights_only=False)
+    assert {"optimizer", "scheduler", "scaler", "python_rng", "numpy_rng", "torch_rng", "cuda_rng"} <= state.keys()
+
+
+def test_early_stopping_tracking_and_init_from(training_case, tmp_path, monkeypatch):
+    tracker = Mock()
+    trainer = training_case(tracker=tracker, metric_fn=lambda gold, pred: 0.5,
+                            eval_every_steps=1, early_stopping_patience=1)
+    assert len(trainer.fit()) == 2 and trainer.state["patience_counter"] == 1
+    assert tracker.log_params.call_args.args[0]["seed"] == 13
+    assert tracker.log_metrics.call_count == 2
+    rows = [json.loads(line) for line in (trainer.run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert rows[0]["config"] and rows[0]["git_commit"] and rows[-1]["val_f1"] == 0.5
+    checkpoint = trainer.run_dir / "best"
+    assert all((checkpoint / name).is_file() for name in ("labels.json", "config.yaml", "trainer_state.pt", "tokenizer_config.json"))
+    fresh = Trainer(None, trainer.train_records, trainer.val_records,
+                    {"output_dir": str(tmp_path / "fresh")}, init_from=checkpoint)
+    assert not fresh.optimizer.state and fresh.state["global_step"] == 0
+    for actual, expected in zip(fresh.tagger.parameters(), load_tagger(checkpoint).parameters()):
+        torch.testing.assert_close(actual, expected)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        fresh.fit(resume="auto")
+    trainer.metric_fn = None
+    monkeypatch.setattr(trainer.tagger, "predict_batch", lambda records, **kwargs:
+                        [{"labels": ["O"]}] + [{"labels": r["labels"]} for r in records[1:]])
+    assert trainer.evaluate() == pytest.approx(6 / 7)  # Three correct entities, one missed.
+
+
+def test_checkpoint_failure_recovery_and_split_guards(training_case, monkeypatch):
+    trainer = training_case()
+    trainer.fit(stop_after=1)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "save", Mock(side_effect=OSError("interrupted write")))
+        with pytest.raises(OSError, match="interrupted write"):
+            trainer.save_checkpoint()
+    last = trainer.run_dir / "last"
+    assert (last / "trainer_state.pt").is_file()
+    with (trainer.run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write('{"kind": "train", "global_step": 999}\n')  # Unsaved work before a crash.
+    last.replace(trainer.run_dir / ".last.previous")  # Simulate a killed publication swap.
+    restored = training_case()
+    restored.resume()
+    assert restored.state == trainer.state and last.is_dir()
+    assert all(json.loads(line)["global_step"] != 999
+               for line in (trainer.run_dir / "metrics.jsonl").read_text().splitlines())
+    bad = [{**trainer.train_records[0], "split": "test"}]
+    held_out = type("HeldOut", (list,), {"split": "test"})(trainer.train_records)
+    for action in (lambda: trainer.collate(bad), lambda: trainer.evaluate(bad),
+                   lambda: trainer.evaluate(split="test"), lambda: trainer.evaluate(held_out),
+                   lambda: trainer.collate(held_out),
+                   lambda: Trainer(trainer.tagger, bad, bad, trainer.config)):
+        with pytest.raises(ValueError, match="test split"):
+            action()
+
+
+@pytest.mark.parametrize("artifact", ["last", "best", "metrics.jsonl"])
+def test_fresh_run_refuses_each_existing_artifact(training_case, artifact):
+    trainer = training_case()
+    path = trainer.run_dir / artifact
+    path.write_text("existing log", encoding="utf-8") if artifact.endswith("jsonl") else path.mkdir()
+    with pytest.raises(FileExistsError, match="resume.*overwrite=True"):
+        trainer.fit(stop_after=1)
+    assert path.exists()
+    if artifact.endswith("jsonl"):
+        assert path.read_text(encoding="utf-8") == "existing log"
+    else:
+        assert not (trainer.run_dir / "metrics.jsonl").exists()
+
+
+def test_fresh_seed_preserves_prior_run_and_overwrite_replaces_it(training_case, tmp_path):
+    original = training_case(eval_every_steps=1)
+    original.fit(stop_after=1)
+    snapshot = {p.relative_to(original.run_dir): p.read_bytes() for p in original.run_dir.rglob("*") if p.is_file()}
+    fresh = training_case(seed=42, eval_every_steps=1)
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        fresh.fit(stop_after=1)
+    assert snapshot == {p.relative_to(fresh.run_dir): p.read_bytes() for p in fresh.run_dir.rglob("*") if p.is_file()}
+    (fresh.run_dir / "old-only.txt").write_text("old artifact", encoding="utf-8")
+    sibling = tmp_path / "outside.txt"
+    sibling.write_text("keep", encoding="utf-8")
+    replacement = training_case(seed=42, overwrite=True, eval_every_steps=1)
+    replacement.fit(stop_after=1)
+    replacement.fit(stop_after=2)  # Continuing the same Trainer must not clear its run.
+    rows = [json.loads(line) for line in (replacement.run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [row["seed"] for row in rows if row["kind"] == "run"] == [42]
+    assert replacement.state["global_step"] == 2 and not (replacement.run_dir / "old-only.txt").exists()
+    assert sibling.read_text(encoding="utf-8") == "keep"
+    assert load_tagger(replacement.run_dir / "best").config["seed"] == 42
+
+
+def test_best_is_lightweight_and_last_retains_resume_state(training_case, monkeypatch):
+    trainer = training_case(eval_every_steps=1)
+    trainer.fit(stop_after=1)
+    best = trainer.run_dir / "best"
+    best_state = torch.load(best / "trainer_state.pt", weights_only=False)
+    assert best_state == {key: trainer.state[key] for key in ("best_metric", "global_step", "epoch")}
+    last_state = torch.load(trainer.run_dir / "last/trainer_state.pt", weights_only=False)
+    assert last_state["optimizer"]["state"] and last_state["losses"] == trainer.state["losses"]
+    assert {"scheduler", "scaler", "python_rng", "numpy_rng", "torch_rng", "cuda_rng", "step_in_epoch"} <= last_state.keys()
+    with monkeypatch.context() as patch:
+        patch.setattr(trainer.optimizer, "state_dict", Mock(side_effect=AssertionError("optimizer serialized")))
+        patch.setattr(trainer.scheduler, "state_dict", Mock(side_effect=AssertionError("scheduler serialized")))
+        patch.setattr(trainer, "scaler", Mock(state_dict=Mock(side_effect=AssertionError("scaler serialized"))))
+        trainer.save_checkpoint("best")
+    doc = trainer.train_records[0]
+    expected = trainer.tagger.predict(doc["words"], doc["boxes"])
+    actual = load_tagger(best).predict(doc["words"], doc["boxes"])
+    np.testing.assert_allclose(actual["label_probs"], expected["label_probs"], atol=1e-6)
+    fresh = training_case("cannot-resume-best")
+    with pytest.raises(ValueError, match="resume from last.*init_from"):
+        fresh.fit(resume=best)
+    assert fresh.state["global_step"] == 0 and not fresh.optimizer.state
+
+
+@pytest.mark.parametrize("extra_leftovers", [False, True])
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_auto_resume_restarts_before_first_last_checkpoint(training_case, monkeypatch, caplog, extra_leftovers, overwrite):
+    attempt = training_case(save_every_steps=100, eval_every_steps=100)
+    log = attempt._log
+
+    def interrupt(kind, **values):
+        log(kind, **values)
+        if kind == "train":
+            raise RuntimeError("killed before first checkpoint")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(attempt, "_log", interrupt)
+        with pytest.raises(RuntimeError, match="before first checkpoint"):
+            attempt.fit()
+    metrics = attempt.run_dir / "metrics.jsonl"
+    assert metrics.is_file() and not (attempt.run_dir / "last").exists()
+    original_log = metrics.read_bytes()
+    with pytest.raises(FileExistsError):
+        training_case(save_every_steps=100, eval_every_steps=100).fit()
+    assert metrics.read_bytes() == original_log
+    leftovers = ("best", ".last.previous", ".best.previous", ".last-abandoned", ".best-abandoned")
+    if extra_leftovers:
+        for name in leftovers:
+            directory = attempt.run_dir / name
+            directory.mkdir()
+            (directory / "partial").write_text("unfinished", encoding="utf-8")
+    unrelated = attempt.run_dir / ".last-notes.txt"
+    unrelated.write_text("keep this file", encoding="utf-8")
+    unrelated_directory = attempt.run_dir / "notes"
+    unrelated_directory.mkdir()
+    expected = training_case("reference", save_every_steps=100, eval_every_steps=100).fit(stop_after=1)
+    restarted = training_case(save_every_steps=100, eval_every_steps=100, overwrite=overwrite)
+    assert restarted.state["global_step"] == 0
+    assert restarted.fit(resume="auto", stop_after=1) == expected
+    rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+    assert [(row["kind"], row["global_step"]) for row in rows] == [("run", 0), ("train", 1)]
+    assert "No resumable last checkpoint" in caplog.text
+    assert all(not (restarted.run_dir / name).exists() for name in leftovers)
+    assert unrelated.read_text(encoding="utf-8") == "keep this file" and unrelated_directory.is_dir()
