@@ -422,3 +422,45 @@ def test_best_is_lightweight_and_last_retains_resume_state(training_case, monkey
     with pytest.raises(ValueError, match="resume from last.*init_from"):
         fresh.fit(resume=best)
     assert fresh.state["global_step"] == 0 and not fresh.optimizer.state
+
+
+@pytest.mark.parametrize("extra_leftovers", [False, True])
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_auto_resume_restarts_before_first_last_checkpoint(training_case, monkeypatch, caplog, extra_leftovers, overwrite):
+    attempt = training_case(save_every_steps=100, eval_every_steps=100)
+    log = attempt._log
+
+    def interrupt(kind, **values):
+        log(kind, **values)
+        if kind == "train":
+            raise RuntimeError("killed before first checkpoint")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(attempt, "_log", interrupt)
+        with pytest.raises(RuntimeError, match="before first checkpoint"):
+            attempt.fit()
+    metrics = attempt.run_dir / "metrics.jsonl"
+    assert metrics.is_file() and not (attempt.run_dir / "last").exists()
+    original_log = metrics.read_bytes()
+    with pytest.raises(FileExistsError):
+        training_case(save_every_steps=100, eval_every_steps=100).fit()
+    assert metrics.read_bytes() == original_log
+    leftovers = ("best", ".last.previous", ".best.previous", ".last-abandoned", ".best-abandoned")
+    if extra_leftovers:
+        for name in leftovers:
+            directory = attempt.run_dir / name
+            directory.mkdir()
+            (directory / "partial").write_text("unfinished", encoding="utf-8")
+    unrelated = attempt.run_dir / ".last-notes.txt"
+    unrelated.write_text("keep this file", encoding="utf-8")
+    unrelated_directory = attempt.run_dir / "notes"
+    unrelated_directory.mkdir()
+    expected = training_case("reference", save_every_steps=100, eval_every_steps=100).fit(stop_after=1)
+    restarted = training_case(save_every_steps=100, eval_every_steps=100, overwrite=overwrite)
+    assert restarted.state["global_step"] == 0
+    assert restarted.fit(resume="auto", stop_after=1) == expected
+    rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+    assert [(row["kind"], row["global_step"]) for row in rows] == [("run", 0), ("train", 1)]
+    assert "No resumable last checkpoint" in caplog.text
+    assert all(not (restarted.run_dir / name).exists() for name in leftovers)
+    assert unrelated.read_text(encoding="utf-8") == "keep this file" and unrelated_directory.is_dir()

@@ -41,6 +41,7 @@ class Trainer:
                  init_from=None, tracker=None, metric_fn=None, overwrite=False):
         self.device, self.init_from = torch.device(device), init_from
         self.overwrite, self._started, self._resumed = overwrite, False, False
+        self._auto_fresh = False
         self.tagger = load_tagger(init_from, device) if init_from else tagger.to(device)
         self.config = _merge(self.tagger.config, config or {})
         _reject_test_split(self.config)
@@ -95,7 +96,7 @@ class Trainer:
     def _start_run(self):
         if self._started:
             return
-        if not self._resumed:
+        if not self._resumed and not self._auto_fresh:
             artifacts = ("last", "best", "metrics.jsonl", ".last.previous", ".best.previous")
             if not self.overwrite and any((self.run_dir / name).exists() for name in artifacts):
                 raise FileExistsError("Run directory contains results; use resume, another output_dir, or overwrite=True")
@@ -198,9 +199,34 @@ class Trainer:
             if previous.exists():
                 shutil.rmtree(previous)
 
+    def _clear_incomplete_attempt(self):
+        """Remove reserved run artifacts, preserving unrelated files and directories."""
+        reserved = {"metrics.jsonl", "best", ".last.previous", ".best.previous"}
+        for path in self.run_dir.iterdir():
+            temporary = path.name.startswith((".last-", ".best-")) and path.is_dir()
+            if path.name not in reserved and not temporary:
+                continue
+            if path.is_symlink():
+                path.unlink()
+                continue
+            if path.resolve().parent != self.run_dir:
+                raise ValueError("Attempt artifacts must stay inside the run directory")
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
     def resume(self, checkpoint="auto"):
         if self.init_from:
             raise ValueError("init_from and resume are mutually exclusive")
+        if checkpoint == "auto" and not (self.run_dir / "last").exists() and not (
+            self.run_dir / ".last.previous/trainer_state.pt"
+        ).is_file():
+            logging.getLogger(__name__).warning("No resumable last checkpoint; removing attempt leftovers and starting fresh")
+            self._clear_incomplete_attempt()
+            self._started, self._resumed = False, False
+            self._auto_fresh = True
+            return
         path = self._recover("last") if checkpoint == "auto" else Path(checkpoint)
         if checkpoint == "auto" and not path.exists():
             return
